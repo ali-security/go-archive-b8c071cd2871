@@ -1,10 +1,12 @@
 name: test
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated Go test names to run (empty runs the full suite)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -28,26 +30,70 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
-      - name: lint
-        uses: golangci/golangci-lint-action@v9
+      - name: Build module zip
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.23.x'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/modzip" "$RUNNER_TEMP/build_output"
+          cd "$RUNNER_TEMP/modzip"
+          cat > create_mod.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          go mod init example.com/modzip
+          go get golang.org/x/mod@v0.22.0
+          go run create_mod.go github.com/moby/go-archive v0.2.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/build_output/v0.2.0.zip"
+          unzip -l "$RUNNER_TEMP/build_output/v0.2.0.zip"
+
+      - name: Upload module zip
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.23.x'
+        uses: actions/upload-artifact@v4
         with:
-          version: v2.7
-          args: --print-resources-usage --timeout=10m --verbose
+          name: go-module-zip
+          path: ${{ runner.temp }}/build_output/v0.2.0.zip
+          if-no-files-found: error
 
       - name: Test
-        run: go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          else
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          fi
+          echo "Test summary (test): top-level passed=$(grep -cE '^--- PASS' "$RUNNER_TEMP/test.log") failed=$(grep -cE '^--- FAIL' "$RUNNER_TEMP/test.log") skipped=$(grep -cE '^--- SKIP' "$RUNNER_TEMP/test.log"); including subtests passed=$(grep -cE '^[[:space:]]*--- PASS' "$RUNNER_TEMP/test.log") failed=$(grep -cE '^[[:space:]]*--- FAIL' "$RUNNER_TEMP/test.log") skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$RUNNER_TEMP/test.log")"
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
 
       - name: Test (root)
         if: runner.os == 'Linux'
-        run: go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/test-root.log"
+          else
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./... 2>&1 | tee "$RUNNER_TEMP/test-root.log"
+          fi
+          echo "Test summary (test-root): top-level passed=$(grep -cE '^--- PASS' "$RUNNER_TEMP/test-root.log") failed=$(grep -cE '^--- FAIL' "$RUNNER_TEMP/test-root.log") skipped=$(grep -cE '^--- SKIP' "$RUNNER_TEMP/test-root.log"); including subtests passed=$(grep -cE '^[[:space:]]*--- PASS' "$RUNNER_TEMP/test-root.log") failed=$(grep -cE '^[[:space:]]*--- FAIL' "$RUNNER_TEMP/test-root.log") skipped=$(grep -cE '^[[:space:]]*--- SKIP' "$RUNNER_TEMP/test-root.log")"
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
-
-      - name: Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          directory: ./

@@ -124,8 +124,10 @@ func TestDecompressStreamBzip2(t *testing.T) {
 }
 
 func TestDecompressStreamXz(t *testing.T) {
+	// TODO Windows: Failing with "xz: /c/Users/(...)/archive: No such file or directory"
+	// (same path-translation failure as the bzip2 and zstd tests below).
 	if runtime.GOOS == "windows" {
-		t.Skip("Xz not present in msys2")
+		t.Skip("Failing on Windows CI machines: xz cannot open the msys-style archive path")
 	}
 	testDecompressStream(t, "xz", "xz -f")
 }
