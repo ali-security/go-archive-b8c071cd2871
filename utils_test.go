@@ -76,7 +76,7 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 		return fmt.Errorf("could not find untar function %q in testUntarFns", untarFn)
 	}
 	if err := untar(dest, reader); err != nil {
-		if !errors.As(err, new(breakoutError)) {
+		if !errors.As(err, new(breakoutError)) && !isPathEscapes(err) {
 			// If untar returns an error unrelated to an archive breakout,
 			// then consider this an unexpected error and abort.
 			return err
@@ -140,6 +140,12 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 	// Since victim/hello was generated with time.Now(), it is safe to assume
 	// that any file whose content matches exactly victim/hello, managed somehow
 	// to access victim/hello.
+	//
+	// Symlinks are intentionally skipped: symlinks are extracted with their
+	// target preserved verbatim (the symlink node itself is inside dest), and
+	// any path followed during extraction is resolved within dest, so a
+	// symlink whose target resolves outside dest does not constitute a
+	// breakout on its own.
 	return filepath.WalkDir(dest, func(path string, info os.DirEntry, err error) error {
 		if info.IsDir() {
 			if err != nil {
@@ -153,6 +159,11 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 			// skip file if error
 			return nil
 		}
+		// Skip symlinks: their targets may point outside dest, but they are
+		// never followed out of dest during extraction.
+		if info.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
 		b, err := os.ReadFile(path)
 		if err != nil {
 			// Houston, we have a problem. Aborting (space)walk.
@@ -163,6 +174,13 @@ func testBreakout(untarFn string, tmpdir string, headers []*tar.Header) error {
 		}
 		return nil
 	})
+}
+
+// isPathEscapes reports whether err is the path-containment error returned
+// when resolving an archive path would follow a symlink out of the
+// extraction root.
+func isPathEscapes(err error) bool {
+	return errors.Is(err, errPathEscapes)
 }
 
 // newTempArchive reads the content of src into a temporary file, and returns the contents

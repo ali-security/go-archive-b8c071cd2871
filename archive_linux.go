@@ -95,7 +95,9 @@ func (c overlayWhiteoutConverter) ConvertRead(hdr *tar.Header, path string) (boo
 		if err := unix.Mknod(originalPath, unix.S_IFCHR, 0); err != nil {
 			return false, fmt.Errorf("failed to mknod('%s', S_IFCHR, 0): %w", originalPath, err)
 		}
-		if err := os.Chown(originalPath, hdr.Uid, hdr.Gid); err != nil {
+		// Use Lchown to never follow a symlink at originalPath out of the
+		// extraction root.
+		if err := os.Lchown(originalPath, hdr.Uid, hdr.Gid); err != nil {
 			return false, err
 		}
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -90,6 +91,11 @@ func NewDefaultArchiver() *Archiver {
 // When testing archive breakout in the unit tests, this error is expected
 // in order for the test to pass.
 type breakoutError error
+
+// errPathEscapes is returned when resolving an archive path within the
+// extraction root would follow a symlink with a relative target out of
+// the root (matching the containment semantics of os.Root).
+var errPathEscapes = errors.New("path escapes from parent")
 
 const (
 	AUFSWhiteoutFormat    WhiteoutFormat = 0 // AUFSWhiteoutFormat is the default format for whiteouts
@@ -402,7 +408,86 @@ func (ta *tarAppender) addTarFile(path, name string) error {
 	return nil
 }
 
-func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, opts *TarOptions) error {
+// resolveArchivePath resolves intermediate symlinks in name within root, so
+// that filesystem operations on the result cannot be redirected out of root
+// by a symlink in one of its parent directories. The final path component is
+// intentionally preserved because archive extraction may create or replace it.
+//
+// name must be a normalized, local, native-separator path relative to root.
+// The returned path is relative to root, with all existing symlinks in its
+// parent directories resolved; any remaining nonexistent components are
+// retained for later creation.
+//
+// Absolute symlinks are resolved relative to root (chroot-like semantics), as
+// they would be within a container's root filesystem. A symlink with a
+// relative target that escapes root is rejected with errPathEscapes unless an
+// absolute symlink was followed before it.
+//
+// The path is resolved before the actual operation, so a concurrent change to
+// the filesystem may cause the operation to affect a different path; archive
+// extraction itself only ever follows symlinks through this function.
+func resolveArchivePath(root, name string) (string, error) {
+	parent, base := filepath.Split(name)
+	if parent == "" {
+		return name, nil
+	}
+
+	root = filepath.Clean(root)
+	resolved, err := resolveFSRootPath(root, filepath.Clean(parent))
+	if err != nil {
+		return "", err
+	}
+	if resolved.relativeEscapeBeforeAbsolute {
+		return "", &os.PathError{Op: "resolve", Path: name, Err: errPathEscapes}
+	}
+
+	relParent, err := filepath.Rel(root, resolved.path)
+	if err != nil {
+		return "", breakoutError(fmt.Errorf(
+			"could not make resolved parent %q relative to root %q: %w",
+			resolved.path,
+			root,
+			err,
+		))
+	}
+	if relParent != "." && !filepath.IsLocal(relParent) {
+		return "", breakoutError(fmt.Errorf(
+			"resolved parent %q escapes root %q",
+			resolved.path,
+			root,
+		))
+	}
+
+	return filepath.Join(relParent, base), nil
+}
+
+// resolveHardlinkTarget validates a POSIX hardlink target and resolves it to
+// the native filesystem path within extractDir used for extraction.
+func resolveHardlinkTarget(extractDir, linkname string) (string, error) {
+	cleaned := path.Clean(linkname)
+	if strings.HasPrefix(cleaned, "/") {
+		// Some image builders (e.g. kaniko) write hardlink targets as absolute
+		// paths. Resolve those relative to the extraction root, with chroot-like
+		// semantics matching absolute symlink targets. Strip the root from the
+		// original linkname rather than the cleaned one so that ".." components
+		// are not collapsed against "/" but instead rejected below.
+		cleaned = path.Clean(strings.TrimLeft(linkname, "/"))
+	}
+	if cleaned == "." || !filepath.IsLocal(cleaned) {
+		return "", breakoutError(fmt.Errorf("invalid hardlink target %q", linkname))
+	}
+	rel, err := resolveArchivePath(extractDir, filepath.FromSlash(cleaned))
+	if err != nil {
+		return "", err
+	}
+	// #nosec G305 -- rel was resolved within extractDir by resolveArchivePath.
+	return filepath.Join(extractDir, rel), nil
+}
+
+// createTarFile extracts a single tar entry to dstPath. dstPath must be within
+// extractDir, with any symlinks in its parent directories already resolved
+// (see resolveArchivePath).
+func createTarFile(dstPath, extractDir string, hdr *tar.Header, reader io.Reader, opts *TarOptions) error {
 	var (
 		Lchown                     = true
 		inUserns, bestEffortXattrs bool
@@ -422,12 +507,21 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
 	// so use hdrInfo.Mode() (they differ for e.g. setuid bits)
 	hdrInfo := hdr.FileInfo()
 
+	var hardlinkTarget string
+	if hdr.Typeflag == tar.TypeLink {
+		var err error
+		hardlinkTarget, err = resolveHardlinkTarget(extractDir, hdr.Linkname)
+		if err != nil {
+			return err
+		}
+	}
+
 	switch hdr.Typeflag {
 	case tar.TypeDir:
 		// Create directory unless it exists as a directory already.
 		// In that case we just want to merge the two
-		if fi, err := os.Lstat(path); err != nil || !fi.IsDir() {
-			if err := os.Mkdir(path, hdrInfo.Mode()); err != nil {
+		if fi, err := os.Lstat(dstPath); err != nil || !fi.IsDir() {
+			if err := os.Mkdir(dstPath, hdrInfo.Mode()); err != nil {
 				return err
 			}
 		}
@@ -435,7 +529,7 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
 	case tar.TypeReg:
 		// Source is regular file. We use sequential file access to avoid depleting
 		// the standby list on Windows. On Linux, this equates to a regular os.OpenFile.
-		file, err := sequential.OpenFile(path, os.O_CREATE|os.O_WRONLY, hdrInfo.Mode())
+		file, err := sequential.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, hdrInfo.Mode())
 		if err != nil {
 			return err
 		}
@@ -447,47 +541,39 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
 
 	case tar.TypeBlock, tar.TypeChar:
 		if inUserns { // cannot create devices in a userns
-			log.G(context.TODO()).WithFields(log.Fields{"path": path, "type": hdr.Typeflag}).Debug("skipping device nodes in a userns")
+			log.G(context.TODO()).WithFields(log.Fields{"path": dstPath, "type": hdr.Typeflag}).Debug("skipping device nodes in a userns")
 			return nil
 		}
 		// Handle this is an OS-specific way
-		if err := handleTarTypeBlockCharFifo(hdr, path); err != nil {
+		if err := handleTarTypeBlockCharFifo(hdr, dstPath); err != nil {
 			return err
 		}
 
 	case tar.TypeFifo:
 		// Handle this is an OS-specific way
-		if err := handleTarTypeBlockCharFifo(hdr, path); err != nil {
+		if err := handleTarTypeBlockCharFifo(hdr, dstPath); err != nil {
 			if inUserns && errors.Is(err, syscall.EPERM) {
 				// In most cases, cannot create a fifo if running in user namespace
-				log.G(context.TODO()).WithFields(log.Fields{"error": err, "path": path, "type": hdr.Typeflag}).Debug("creating fifo node in a userns")
+				log.G(context.TODO()).WithFields(log.Fields{"error": err, "path": dstPath, "type": hdr.Typeflag}).Debug("creating fifo node in a userns")
 				return nil
 			}
 			return err
 		}
 
 	case tar.TypeLink:
-		// #nosec G305 -- The target path is checked for path traversal.
-		targetPath := filepath.Join(extractDir, hdr.Linkname)
-		// check for hardlink breakout
-		if !strings.HasPrefix(targetPath, extractDir) {
-			return breakoutError(fmt.Errorf("invalid hardlink %q -> %q", targetPath, hdr.Linkname))
-		}
-		if err := os.Link(targetPath, path); err != nil {
+		// hardlinkTarget was validated and resolved within extractDir above;
+		// link does not follow it if it is itself a symlink.
+		if err := link(hardlinkTarget, dstPath); err != nil {
 			return err
 		}
 
 	case tar.TypeSymlink:
-		// 	path 				-> hdr.Linkname = targetPath
-		// e.g. /extractDir/path/to/symlink 	-> ../2/file	= /extractDir/path/2/file
-		targetPath := filepath.Join(filepath.Dir(path), hdr.Linkname) // #nosec G305 -- The target path is checked for path traversal.
-
-		// the reason we don't need to check symlinks in the path (with FollowSymlinkInScope) is because
-		// that symlink would first have to be created, which would be caught earlier, at this very check:
-		if !strings.HasPrefix(targetPath, extractDir) {
-			return breakoutError(fmt.Errorf("invalid symlink %q -> %q", path, hdr.Linkname))
-		}
-		if err := os.Symlink(hdr.Linkname, path); err != nil {
+		// Symlink targets are archive data, not filesystem paths, and are
+		// preserved verbatim. The symlink node itself is always created at
+		// dstPath within extractDir; containment applies when the symlink is
+		// followed, as every path used during extraction is resolved within
+		// extractDir (see resolveArchivePath) rather than by the OS.
+		if err := os.Symlink(hdr.Linkname, dstPath); err != nil {
 			return err
 		}
 
@@ -504,12 +590,12 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
 		if chownOpts == nil {
 			chownOpts = &ChownOpts{UID: hdr.Uid, GID: hdr.Gid}
 		}
-		if err := os.Lchown(path, chownOpts.UID, chownOpts.GID); err != nil {
+		if err := os.Lchown(dstPath, chownOpts.UID, chownOpts.GID); err != nil {
 			var msg string
 			if inUserns && errors.Is(err, syscall.EINVAL) {
 				msg = " (try increasing the number of subordinate IDs in /etc/subuid and /etc/subgid)"
 			}
-			return fmt.Errorf("failed to Lchown %q for UID %d, GID %d%s: %w", path, hdr.Uid, hdr.Gid, msg, err)
+			return fmt.Errorf("failed to Lchown %q for UID %d, GID %d%s: %w", dstPath, hdr.Uid, hdr.Gid, msg, err)
 		}
 	}
 
@@ -519,7 +605,7 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
 		if !ok {
 			continue
 		}
-		if err := lsetxattr(path, xattr, []byte(value), 0); err != nil {
+		if err := lsetxattr(dstPath, xattr, []byte(value), 0); err != nil {
 			if bestEffortXattrs && errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EPERM) {
 				// EPERM occurs if modifying xattrs is not allowed. This can
 				// happen when running in userns with restrictions (ChromeOS).
@@ -538,7 +624,7 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
 
 	// There is no LChmod, so ignore mode for symlink. Also, this
 	// must happen after chown, as that can modify the file mode
-	if err := handleLChmod(hdr, path, hdrInfo); err != nil {
+	if err := handleLChmod(hdr, dstPath, hardlinkTarget, hdrInfo); err != nil {
 		return err
 	}
 
@@ -547,17 +633,18 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
 
 	// chtimes doesn't support a NOFOLLOW flag atm
 	if hdr.Typeflag == tar.TypeLink {
-		if fi, err := os.Lstat(hdr.Linkname); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
-			if err := chtimes(path, aTime, mTime); err != nil {
+		// Follow the hardlink only when its (resolved) target is not itself a symlink.
+		if fi, err := os.Lstat(hardlinkTarget); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
+			if err := chtimes(dstPath, aTime, mTime); err != nil {
 				return err
 			}
 		}
 	} else if hdr.Typeflag != tar.TypeSymlink {
-		if err := chtimes(path, aTime, mTime); err != nil {
+		if err := chtimes(dstPath, aTime, mTime); err != nil {
 			return err
 		}
 	} else {
-		if err := lchtimes(path, aTime, mTime); err != nil {
+		if err := lchtimes(dstPath, aTime, mTime); err != nil {
 			return err
 		}
 	}
@@ -828,10 +915,24 @@ loop:
 			continue
 		}
 
-		// Normalize name, for safety and for a simple is-root check
-		// This keeps "../" as-is, but normalizes "/../" to "/". Or Windows:
-		// This keeps "..\" as-is, but normalizes "\..\" to "\".
-		hdr.Name = filepath.Clean(hdr.Name)
+		// Strip a leading "/" so absolute entries stay root-relative, and
+		// normalize the POSIX tar path. Skip entries referring to the extraction
+		// root and reject paths that escape it.
+		name := path.Clean(strings.TrimLeft(hdr.Name, "/"))
+		if name == "." {
+			continue
+		}
+		origName := hdr.Name
+		hdr.Name = name
+
+		// Skip entries whose name (or hardlink target) Windows cannot represent.
+		if err := unrepresentableOnWindows(hdr); err != nil {
+			log.G(context.TODO()).Warnf("Windows: ignoring entry: %v", err)
+			continue
+		}
+		if !filepath.IsLocal(name) {
+			return breakoutError(fmt.Errorf("invalid entry name %q", origName))
+		}
 
 		for _, exclude := range options.ExcludePatterns {
 			if strings.HasPrefix(hdr.Name, exclude) {
@@ -839,37 +940,37 @@ loop:
 			}
 		}
 
-		// Ensure that the parent directory exists.
-		err = createImpliedDirectories(dest, hdr, options)
+		// Resolve symlinks in the parent directories of the entry within dest,
+		// so that extracting it cannot be redirected outside of dest.
+		relPath, err := resolveArchivePath(dest, filepath.FromSlash(hdr.Name))
 		if err != nil {
 			return err
 		}
 
-		// #nosec G305 -- The joined path is checked for path traversal.
-		path := filepath.Join(dest, hdr.Name)
-		rel, err := filepath.Rel(dest, path)
+		// Ensure that the parent directory exists.
+		err = createImpliedDirectories(dest, relPath, options)
 		if err != nil {
 			return err
 		}
-		if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			return breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
-		}
+
+		// #nosec G305 -- relPath was resolved within dest by resolveArchivePath.
+		dstPath := filepath.Join(dest, relPath)
 
 		// If path exits we almost always just want to remove and replace it
 		// The only exception is when it is a directory *and* the file from
 		// the layer is also a directory. Then we want to merge them (i.e.
 		// just apply the metadata from the layer).
-		if fi, err := os.Lstat(path); err == nil {
+		if fi, err := os.Lstat(dstPath); err == nil {
 			if options.NoOverwriteDirNonDir && fi.IsDir() && hdr.Typeflag != tar.TypeDir {
 				// If NoOverwriteDirNonDir is true then we cannot replace
 				// an existing directory with a non-directory from the archive.
-				return fmt.Errorf("cannot overwrite directory %q with non-directory %q", path, dest)
+				return fmt.Errorf("cannot overwrite directory %q with non-directory %q", dstPath, dest)
 			}
 
 			if options.NoOverwriteDirNonDir && !fi.IsDir() && hdr.Typeflag == tar.TypeDir {
 				// If NoOverwriteDirNonDir is true then we cannot replace
 				// an existing non-directory with a directory from the archive.
-				return fmt.Errorf("cannot overwrite non-directory %q with directory %q", path, dest)
+				return fmt.Errorf("cannot overwrite non-directory %q with directory %q", dstPath, dest)
 			}
 
 			if fi.IsDir() && hdr.Name == "." {
@@ -877,7 +978,7 @@ loop:
 			}
 
 			if !fi.IsDir() || hdr.Typeflag != tar.TypeDir {
-				if err := os.RemoveAll(path); err != nil {
+				if err := os.RemoveAll(dstPath); err != nil {
 					return err
 				}
 			}
@@ -888,7 +989,7 @@ loop:
 		}
 
 		if whiteoutConverter != nil {
-			writeFile, err := whiteoutConverter.ConvertRead(hdr, path)
+			writeFile, err := whiteoutConverter.ConvertRead(hdr, dstPath)
 			if err != nil {
 				return err
 			}
@@ -897,7 +998,7 @@ loop:
 			}
 		}
 
-		if err := createTarFile(path, dest, hdr, tr, options); err != nil {
+		if err := createTarFile(dstPath, dest, hdr, tr, options); err != nil {
 			return err
 		}
 
@@ -909,12 +1010,54 @@ loop:
 	}
 
 	for _, hdr := range dirs {
-		// #nosec G305 -- The header was checked for path traversal before it was appended to the dirs slice.
-		path := filepath.Join(dest, hdr.Name)
-
-		if err := chtimes(path, boundTime(latestTime(hdr.AccessTime, hdr.ModTime)), boundTime(hdr.ModTime)); err != nil {
+		if err := chtimesDir(dest, hdr.Name, boundTime(latestTime(hdr.AccessTime, hdr.ModTime)), boundTime(hdr.ModTime)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// chtimesDir changes the access and modified time of the directory that was
+// extracted from the archive entry name into dest.
+//
+// The directory is resolved again within dest, as entries extracted after it
+// may have replaced it, or one of its parents, with a symlink. If it is no
+// longer a directory, it is left alone, so that the timestamps are never
+// applied through a symlink.
+func chtimesDir(dest, name string, atime, mtime time.Time) error {
+	relPath, err := resolveArchivePath(dest, filepath.FromSlash(name))
+	if err != nil {
+		return err
+	}
+	// #nosec G305 -- relPath was resolved within dest by resolveArchivePath.
+	dstPath := filepath.Join(dest, relPath)
+	fi, err := os.Lstat(dstPath)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return nil
+	}
+	return chtimes(dstPath, atime, mtime)
+}
+
+// unrepresentableOnWindows returns an error describing why a tar entry cannot
+// be faithfully created on Windows, or nil if it can (always on non-Windows).
+// On Windows ":" is illegal in a filename and "\" is a path separator, so a tar
+// name or hardlink target containing them (they use POSIX semantics) would be
+// misinterpreted (e.g. "a\b" resolved as two components). Symlink targets are
+// stored verbatim (not resolved at creation), so they are exempt.
+func unrepresentableOnWindows(hdr *tar.Header) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	if strings.ContainsAny(hdr.Name, `:\`) {
+		return fmt.Errorf("entry name %q contains a character Windows cannot represent in a path", hdr.Name)
+	}
+	// A hardlink target is resolved within the destination; a symlink target
+	// is stored verbatim, so only hardlinks need the target checked.
+	if hdr.Typeflag == tar.TypeLink && strings.ContainsAny(hdr.Linkname, `:\`) {
+		return fmt.Errorf("hardlink target %q contains a character Windows cannot represent in a path", hdr.Linkname)
 	}
 	return nil
 }
@@ -924,24 +1067,29 @@ loop:
 // defined by the paths of files in the tar, but there are no header entries for the directories themselves, and thus
 // we most both create them and choose metadata like permissions.
 //
-// The caller should have performed filepath.Clean(hdr.Name), so hdr.Name will now be in the filepath format for the OS
-// on which the daemon is running. This precondition is required because this function assumes a OS-specific path
-// separator when checking that a path is not the root.
-func createImpliedDirectories(dest string, hdr *tar.Header, options *TarOptions) error {
-	// Not the root directory, ensure that the parent directory exists
-	if !strings.HasSuffix(hdr.Name, string(os.PathSeparator)) {
-		parent := filepath.Dir(hdr.Name)
-		parentPath := filepath.Join(dest, parent)
-		if _, err := os.Lstat(parentPath); err != nil && os.IsNotExist(err) {
-			// RootPair() is confined inside this loop as most cases will not require a call, so we can spend some
-			// unneeded function calls in the uncommon case to encapsulate logic -- implied directories are a niche
-			// usage that reduces the portability of an image.
-			uid, gid := options.IDMap.RootPair()
+// dstPath must be a normalized, native-separator path relative to dest, with any symlinks in its parent directories
+// already resolved within dest (see resolveArchivePath), so that creating the parent directories cannot follow a
+// symlink out of dest.
+func createImpliedDirectories(dest, dstPath string, options *TarOptions) error {
+	parent := filepath.Dir(dstPath)
+	// Skip when the parent is the root itself; nothing to create.
+	if parent == "." || parent == "" {
+		return nil
+	}
+	// #nosec G305 -- dstPath was resolved within dest by resolveArchivePath.
+	parentPath := filepath.Join(dest, parent)
+	if _, err := os.Lstat(parentPath); err != nil && os.IsNotExist(err) {
+		if options.NoLchown {
+			return os.MkdirAll(parentPath, ImpliedDirectoryMode)
+		}
+		// RootPair() is confined inside this loop as most cases will not require a call, so we can spend some
+		// unneeded function calls in the uncommon case to encapsulate logic -- implied directories are a niche
+		// usage that reduces the portability of an image.
+		uid, gid := options.IDMap.RootPair()
 
-			err = user.MkdirAllAndChown(parentPath, ImpliedDirectoryMode, uid, gid, user.WithOnlyNew)
-			if err != nil {
-				return err
-			}
+		err = user.MkdirAllAndChown(parentPath, ImpliedDirectoryMode, uid, gid, user.WithOnlyNew)
+		if err != nil {
+			return err
 		}
 	}
 
